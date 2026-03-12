@@ -196,6 +196,26 @@ class GatewayServices:
         raw = request.query_params.get(name, "")
         return [item.strip() for item in raw.split(",") if item.strip()]
 
+    def _query_float(self, request: Request, name: str, default: float) -> float:
+        raw = request.query_params.get(name)
+        if raw is None or raw == "":
+            return default
+        try:
+            return float(raw)
+        except ValueError as exc:
+            raise GatewayError(f"invalid float query parameter: {name}") from exc
+
+    def _query_bool(self, request: Request, name: str, default: bool) -> bool:
+        raw = request.query_params.get(name)
+        if raw is None or raw == "":
+            return default
+        value = raw.strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            return True
+        if value in {"0", "false", "no", "off"}:
+            return False
+        raise GatewayError(f"invalid boolean query parameter: {name}")
+
     def _require_query(self, request: Request, name: str) -> str:
         value = request.query_params.get(name)
         if not value:
@@ -2341,6 +2361,164 @@ class GatewayServices:
             if key in self.plugin._recent_sessions
         ]
 
+    def _get_log_broker(self) -> Any:
+        for handler in logger.handlers:
+            if isinstance(handler, LogQueueHandler):
+                return handler.log_broker
+        return None
+
+    def _publish_event_log(self, event_id: str, action: str, **fields: Any) -> None:
+        entry = {
+            "type": "gateway_event",
+            "level": "INFO",
+            "time": dt.datetime.now(dt.timezone.utc).timestamp(),
+            "event_id": event_id,
+            "action": action,
+            "fields": serialize_value(fields),
+            "data": f"gateway_event event_id={event_id} action={action}",
+        }
+        broker = self._get_log_broker()
+        if broker is not None:
+            broker.publish(entry)
+        else:
+            logger.info(entry["data"])
+
+    def _log_entry_matches_event_id(self, log_entry: dict[str, Any], event_id: str) -> bool:
+        needle = str(event_id or "").strip()
+        if not needle:
+            return False
+        data = log_entry.get("data")
+        if isinstance(data, str) and needle in data:
+            return True
+        try:
+            return needle in json.dumps(log_entry, ensure_ascii=False, default=str)
+        except Exception:
+            return False
+
+    def _filter_event_logs(
+        self,
+        entries: list[dict[str, Any]],
+        event_id: str,
+        *,
+        since: float | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        matched: list[dict[str, Any]] = []
+        for entry in entries:
+            if since is not None and float(entry.get("time", 0) or 0) <= since:
+                continue
+            if self._log_entry_matches_event_id(entry, event_id):
+                matched.append(serialize_value(entry))
+        if limit > 0:
+            matched = matched[-limit:]
+        return matched
+
+    async def event_logs(
+        self, request: Request, payload: None = None
+    ) -> dict[str, Any]:
+        event_id = request.path_params["event_id"]
+        limit = max(1, min(self._query_int(request, "limit", 200), 5000))
+        wait_seconds = max(
+            0.0,
+            min(self._query_float(request, "wait_seconds", 0.0), 600.0),
+        )
+        broker = self._get_log_broker()
+        if broker is None:
+            raise GatewayError("log broker is not available", status_code=503)
+
+        history = self._filter_event_logs(list(broker.log_cache), event_id, limit=limit)
+        live: list[dict[str, Any]] = []
+        if wait_seconds > 0:
+            queue = broker.register()
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + wait_seconds
+            try:
+                while True:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        entry = await asyncio.wait_for(queue.get(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        break
+                    if self._log_entry_matches_event_id(entry, event_id):
+                        live.append(serialize_value(entry))
+                        if len(live) >= limit:
+                            live = live[-limit:]
+            finally:
+                broker.unregister(queue)
+
+        return {
+            "event_id": event_id,
+            "mode": "watch" if wait_seconds > 0 else "history",
+            "wait_seconds": wait_seconds,
+            "history": history,
+            "live": live,
+            "logs": [*(history[-limit:]), *live][-limit:],
+            "count": len(history) + len(live),
+        }
+
+    async def stream_event_logs(
+        self, request: Request, payload: None = None
+    ) -> StreamingResponse:
+        event_id = request.path_params["event_id"]
+        limit = max(1, min(self._query_int(request, "limit", 200), 5000))
+        replay_history = self._query_bool(request, "replay_history", True)
+        broker = self._get_log_broker()
+        if broker is None:
+            raise GatewayError("log broker is not available", status_code=503)
+
+        last_event_id = request.headers.get("Last-Event-ID")
+        since = None
+        if last_event_id:
+            try:
+                since = float(last_event_id)
+            except ValueError:
+                since = None
+
+        async def stream():
+            if replay_history:
+                cached = self._filter_event_logs(
+                    list(broker.log_cache),
+                    event_id,
+                    since=since,
+                    limit=limit,
+                )
+                for entry in cached:
+                    ts = float(entry.get("time", 0) or 0)
+                    payload = {"type": "log", "event_id": event_id, **entry}
+                    yield f"id: {ts}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+            queue = broker.register()
+            try:
+                while True:
+                    try:
+                        entry = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        yield ": keep-alive\n\n"
+                        continue
+                    if not self._log_entry_matches_event_id(entry, event_id):
+                        continue
+                    ts = float(entry.get("time", 0) or 0)
+                    payload = {
+                        "type": "log",
+                        "event_id": event_id,
+                        **serialize_value(entry),
+                    }
+                    yield f"id: {ts}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            finally:
+                broker.unregister(queue)
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     async def send_message(
         self, request: Request, payload: SendMessageRequest
     ) -> dict[str, Any]:
@@ -3195,6 +3373,14 @@ class GatewayServices:
             "webui_session": session_info,
             "persist_bot_response": bot_response_persistence,
         }
+
+
+
+
+
+
+
+
 
 
 

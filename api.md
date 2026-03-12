@@ -175,6 +175,13 @@ Declaration-driven FastAPI gateway for AstrBot runtime managers, plugin hooks, c
 | `POST` | `/messages/send-last` | `SendLastMessageRequest` | Send to last captured session |
 | `GET` | `/messages/history` | - | Query persisted history |
 
+### Logs
+
+| Method | Path | Body | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/logs/events/{event_id}` | - | Filter cached logs by one event/message id; supports `wait_seconds` for short watch |
+| `GET` | `/logs/events/{event_id}/stream` | - | SSE stream of logs for one event/message id |
+
 ### Conversations
 
 | Method | Path | Body | Notes |
@@ -352,6 +359,22 @@ Declaration-driven FastAPI gateway for AstrBot runtime managers, plugin hooks, c
 {"active":true}
 ```
 
+### Log Watch By Event Id
+
+History plus short watch:
+
+```bash
+curl -H "Authorization: Bearer change-me" "http://127.0.0.1:6185/logs/events/injected_1f8f87a90ca84102ba45cc12bb26aada?wait_seconds=5&limit=200"
+```
+
+Continuous SSE monitoring:
+
+```bash
+curl -N -H "Authorization: Bearer change-me" "http://127.0.0.1:6185/logs/events/injected_1f8f87a90ca84102ba45cc12bb26aada/stream"
+```
+
+`event_id` is a plain identifier match against AstrBot log entries. In practice this is most useful for `message_id` values such as `injected_xxx` and `tool_xxx` returned by this gateway.
+
 ### Inject Synthetic Inbound Message
 
 WebChat-compatible injection:
@@ -441,6 +464,7 @@ Current parity against the missing items audited for AstrBot Dashboard routes:
 - Keep AstrBot-internal logic in `gateway/services.py`.
 - FastAPI route generation, auth, multipart parsing, and OpenAPI live in `gateway/server.py`.
 - If you add a new write endpoint, keep demo mode parity by calling `_ensure_mutation_allowed()`.
+
 
 
 
