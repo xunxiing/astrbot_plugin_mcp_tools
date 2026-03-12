@@ -1,0 +1,54 @@
+{
+  "enable_server": {
+    "description": "Start the embedded FastAPI REST gateway.",
+    "type": "bool",
+    "default": true
+  },
+  "host": {
+    "description": "Bind address for the REST gateway. Use 127.0.0.1 for local-only access.",
+    "type": "string",
+    "default": "127.0.0.1"
+  },
+  "port": {
+    "description": "Bind port for the REST gateway.",
+    "type": "int",
+    "default": 6185
+  },
+  "auth_token": {
+    "description": "Bearer token required by all authenticated endpoints.",
+    "type": "string",
+    "default": "change-me"
+  },
+  "cors_allow_origins": {
+    "description": "Allowed CORS origins for browser-based clients.",
+    "type": "list",
+    "default": [
+      "*"
+    ]
+  },
+  "enable_docs": {
+    "description": "Expose the FastAPI Swagger UI and OpenAPI schema.",
+    "type": "bool",
+    "default": true
+  },
+  "docs_path": {
+    "description": "Path of the Swagger UI endpoint.",
+    "type": "string",
+    "default": "/docs"
+  },
+  "openapi_path": {
+    "description": "Path of the OpenAPI JSON schema endpoint.",
+    "type": "string",
+    "default": "/openapi.json"
+  },
+  "capture_recent_sessions": {
+    "description": "Capture incoming sessions for proactive reply endpoints.",
+    "type": "bool",
+    "default": true
+  },
+  "max_recent_sessions": {
+    "description": "Maximum number of recent sessions kept in memory.",
+    "type": "int",
+    "default": 100
+  }
+}
