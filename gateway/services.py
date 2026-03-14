@@ -1,9 +1,10 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import base64
 import copy
 import datetime as dt
+import gc
 import hashlib
 import json
 import mimetypes
@@ -772,6 +773,27 @@ class GatewayServices:
             f"{message_type_value}:{target['session_id']}"
         )
 
+    def _extract_rest_display_payload(self, raw_message: Any) -> dict[str, Any] | None:
+        if isinstance(raw_message, dict):
+            return raw_message
+        if (
+            isinstance(raw_message, tuple)
+            and len(raw_message) >= 3
+            and isinstance(raw_message[2], dict)
+        ):
+            return raw_message[2]
+        return None
+
+    def _split_webchat_session_id(
+        self, session_id: str, fallback_sender_id: str
+    ) -> tuple[str, str]:
+        text = str(session_id or "").strip()
+        if text.startswith("webchat!"):
+            parts = text.split("!", 2)
+            if len(parts) == 3 and parts[1] and parts[2]:
+                return parts[1], parts[2]
+        return fallback_sender_id, text
+
     async def _mirror_platform_injection_request_to_webui(
         self,
         payload: InjectMessageRequest,
@@ -860,9 +882,10 @@ class GatewayServices:
     ) -> None:
         message_obj = getattr(event, "message_obj", None)
         raw_message = getattr(message_obj, "raw_message", None)
-        if not isinstance(raw_message, dict):
+        payload = self._extract_rest_display_payload(raw_message)
+        if not isinstance(payload, dict):
             return
-        display_meta = raw_message.get("_rest_display")
+        display_meta = payload.get("_rest_display")
         if not isinstance(display_meta, dict) or not display_meta.get("enabled"):
             return
 
@@ -942,7 +965,7 @@ class GatewayServices:
         abm.message_str = message_chain.get_plain_text(
             with_other_comps_mark=True
         ).strip()
-        abm.raw_message = {
+        rest_payload = {
             "type": "rest_synthetic_inbound",
             "source": "rest_api",
             "platform_id": target["platform_id"],
@@ -980,6 +1003,13 @@ class GatewayServices:
                 ),
             },
         }
+        if target["platform_id"] == "webchat":
+            webchat_username, conversation_id = self._split_webchat_session_id(
+                target["session_id"], payload.sender_id
+            )
+            abm.raw_message = (webchat_username, conversation_id, rest_payload)
+        else:
+            abm.raw_message = rest_payload
         if target["group_id"]:
             abm.group = Group(group_id=str(target["group_id"]))
 
@@ -1522,7 +1552,7 @@ class GatewayServices:
         message_id: str,
         timeout_seconds: float,
     ) -> None:
-        back_queue = webchat_queue_mgr.get_or_create_back_queue(conversation_id)
+        back_queue = webchat_queue_mgr.get_or_create_back_queue(message_id, conversation_id)
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         buffered_foreign_messages: list[dict[str, Any]] = []
         accumulated_parts: list[dict[str, Any]] = []
@@ -1617,6 +1647,7 @@ class GatewayServices:
         finally:
             for item in buffered_foreign_messages:
                 await back_queue.put(item)
+            webchat_queue_mgr.remove_back_queue(message_id)
 
     async def download_attachment(self, request: Request, payload: None = None):
         attachment_id = request.path_params["attachment_id"]
@@ -2367,6 +2398,170 @@ class GatewayServices:
                 return handler.log_broker
         return None
 
+    def _normalize_log_level_name(self, value: str) -> str:
+        normalized = str(value or "").strip().upper()
+        aliases = {
+            "WARN": "WARNING",
+            "ERRO": "ERROR",
+            "ERR": "ERROR",
+            "CRIT": "CRITICAL",
+            "FATAL": "CRITICAL",
+            "DBUG": "DEBUG",
+        }
+        return aliases.get(normalized, normalized)
+
+    def _resolve_log_levels(self, request: Request) -> set[str]:
+        levels = self._query_csv(request, "level")
+        return {
+            normalized
+            for normalized in (
+                self._normalize_log_level_name(level) for level in levels
+            )
+            if normalized
+        }
+
+    def _log_entry_matches_filters(
+        self,
+        log_entry: dict[str, Any],
+        *,
+        levels: set[str] | None = None,
+        contains: str | None = None,
+        since: float | None = None,
+    ) -> bool:
+        entry_time = float(log_entry.get("time", 0) or 0)
+        if since is not None and entry_time <= since:
+            return False
+        if levels:
+            entry_level = self._normalize_log_level_name(str(log_entry.get("level", "")))
+            if entry_level not in levels:
+                return False
+        if contains:
+            needle = contains.casefold()
+            haystacks = [
+                log_entry.get("data"),
+                log_entry.get("event_id"),
+                log_entry.get("action"),
+            ]
+            for item in haystacks:
+                if isinstance(item, str) and needle in item.casefold():
+                    return True
+            try:
+                dumped = json.dumps(log_entry, ensure_ascii=False, default=str)
+            except Exception:
+                dumped = str(log_entry)
+            return needle in dumped.casefold()
+        return True
+
+    def _filter_logs(
+        self,
+        entries: list[dict[str, Any]],
+        *,
+        levels: set[str] | None = None,
+        contains: str | None = None,
+        since: float | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        matched: list[dict[str, Any]] = []
+        for entry in entries:
+            if self._log_entry_matches_filters(
+                entry,
+                levels=levels,
+                contains=contains,
+                since=since,
+            ):
+                matched.append(serialize_value(entry))
+        if limit > 0:
+            matched = matched[-limit:]
+        return matched
+
+    async def _collect_logs(
+        self,
+        *,
+        broker: Any,
+        levels: set[str] | None = None,
+        contains: str | None = None,
+        wait_seconds: float = 0.0,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        history = self._filter_logs(
+            list(broker.log_cache),
+            levels=levels,
+            contains=contains,
+            limit=limit,
+        )
+        live: list[dict[str, Any]] = []
+        if wait_seconds > 0:
+            queue = broker.register()
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + wait_seconds
+            try:
+                while True:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        entry = await asyncio.wait_for(queue.get(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        break
+                    if self._log_entry_matches_filters(
+                        entry,
+                        levels=levels,
+                        contains=contains,
+                    ):
+                        live.append(serialize_value(entry))
+                        if len(live) >= limit:
+                            live = live[-limit:]
+            finally:
+                broker.unregister(queue)
+        logs = [*(history[-limit:]), *live][-limit:]
+        return {
+            "mode": "watch" if wait_seconds > 0 else "history",
+            "wait_seconds": wait_seconds,
+            "history": history,
+            "live": live,
+            "logs": logs,
+            "count": len(history) + len(live),
+        }
+
+    def _format_compact_log_line(self, entry: dict[str, Any]) -> str:
+        timestamp = float(entry.get("time", 0) or 0)
+        iso_time = dt.datetime.fromtimestamp(timestamp, dt.timezone.utc).isoformat()
+        level = self._normalize_log_level_name(str(entry.get("level", "")) or "INFO")
+        data = str(entry.get("data", "") or "")
+        return f"{iso_time} [{level}] {data}"
+
+    def _resolve_core_lifecycle(self) -> Any:
+        cached = getattr(self.plugin, "_core_lifecycle", None)
+        if cached is not None:
+            return cached
+        try:
+            from astrbot.core.core_lifecycle import AstrBotCoreLifecycle
+        except Exception as exc:
+            raise GatewayError(
+                f"failed to import AstrBotCoreLifecycle: {exc}",
+                status_code=503,
+            ) from exc
+
+        fallback: list[Any] = []
+        for obj in gc.get_objects():
+            try:
+                if not isinstance(obj, AstrBotCoreLifecycle):
+                    continue
+            except Exception:
+                continue
+            if getattr(obj, "star_context", None) is self.context:
+                self.plugin._core_lifecycle = obj
+                return obj
+            if getattr(obj, "plugin_manager", None) is self.plugin_manager:
+                self.plugin._core_lifecycle = obj
+                return obj
+            if getattr(obj, "provider_manager", None) is self.provider_manager:
+                fallback.append(obj)
+        if len(fallback) == 1:
+            self.plugin._core_lifecycle = fallback[0]
+            return fallback[0]
+        raise GatewayError("AstrBot core lifecycle is not available", status_code=503)
+
     def _publish_event_log(self, event_id: str, action: str, **fields: Any) -> None:
         entry = {
             "type": "gateway_event",
@@ -2458,6 +2653,42 @@ class GatewayServices:
             "count": len(history) + len(live),
         }
 
+    async def log_history(
+        self, request: Request, payload: None = None
+    ) -> dict[str, Any]:
+        limit = max(1, min(self._query_int(request, "limit", 200), 5000))
+        wait_seconds = max(
+            0.0,
+            min(self._query_float(request, "wait_seconds", 0.0), 600.0),
+        )
+        contains = request.query_params.get("contains")
+        levels = self._resolve_log_levels(request)
+        broker = self._get_log_broker()
+        if broker is None:
+            raise GatewayError("log broker is not available", status_code=503)
+
+        result = await self._collect_logs(
+            broker=broker,
+            levels=levels,
+            contains=contains,
+            wait_seconds=wait_seconds,
+            limit=limit,
+        )
+        result["filters"] = {
+            "level": sorted(levels),
+            "contains": contains,
+        }
+        return result
+
+    async def log_compact(
+        self, request: Request, payload: None = None
+    ) -> dict[str, Any]:
+        result = await self.log_history(request, payload)
+        lines = [self._format_compact_log_line(entry) for entry in result["logs"]]
+        result["lines"] = lines
+        result["text"] = "\n".join(lines)
+        return result
+
     async def stream_event_logs(
         self, request: Request, payload: None = None
     ) -> StreamingResponse:
@@ -2518,6 +2749,91 @@ class GatewayServices:
                 "X-Accel-Buffering": "no",
             },
         )
+
+    async def stream_logs(
+        self, request: Request, payload: None = None
+    ) -> StreamingResponse:
+        limit = max(1, min(self._query_int(request, "limit", 200), 5000))
+        replay_history = self._query_bool(request, "replay_history", True)
+        contains = request.query_params.get("contains")
+        levels = self._resolve_log_levels(request)
+        broker = self._get_log_broker()
+        if broker is None:
+            raise GatewayError("log broker is not available", status_code=503)
+
+        last_event_id = request.headers.get("Last-Event-ID")
+        since = None
+        if last_event_id:
+            try:
+                since = float(last_event_id)
+            except ValueError:
+                since = None
+
+        async def stream():
+            if replay_history:
+                cached = self._filter_logs(
+                    list(broker.log_cache),
+                    levels=levels,
+                    contains=contains,
+                    since=since,
+                    limit=limit,
+                )
+                for entry in cached:
+                    ts = float(entry.get("time", 0) or 0)
+                    payload = {
+                        "type": "log",
+                        "filters": {
+                            "level": sorted(levels),
+                            "contains": contains,
+                        },
+                        **entry,
+                    }
+                    yield f"id: {ts}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+            queue = broker.register()
+            try:
+                while True:
+                    try:
+                        entry = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        yield ": keep-alive\n\n"
+                        continue
+                    if not self._log_entry_matches_filters(
+                        entry,
+                        levels=levels,
+                        contains=contains,
+                    ):
+                        continue
+                    ts = float(entry.get("time", 0) or 0)
+                    payload = {
+                        "type": "log",
+                        "filters": {
+                            "level": sorted(levels),
+                            "contains": contains,
+                        },
+                        **serialize_value(entry),
+                    }
+                    yield f"id: {ts}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            finally:
+                broker.unregister(queue)
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    async def restart_core(
+        self, request: Request, payload: None = None
+    ) -> dict[str, Any]:
+        self._ensure_mutation_allowed()
+        lifecycle = self._resolve_core_lifecycle()
+        await lifecycle.restart()
+        return {"accepted": True, "restarting": True}
 
     async def send_message(
         self, request: Request, payload: SendMessageRequest
@@ -3373,6 +3689,9 @@ class GatewayServices:
             "webui_session": session_info,
             "persist_bot_response": bot_response_persistence,
         }
+
+
+
 
 
 

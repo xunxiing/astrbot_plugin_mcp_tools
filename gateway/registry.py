@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 
@@ -66,6 +66,13 @@ ENDPOINTS: tuple[EndpointDefinition, ...] = (
     ),
     EndpointDefinition(
         "GET", "/meta", "meta", "Gateway metadata and subsystem summary", ("system",)
+    ),
+    EndpointDefinition(
+        "POST",
+        "/system/restart-core",
+        "restart_core",
+        "Restart AstrBot core process",
+        ("system",),
     ),
     EndpointDefinition(
         "GET",
@@ -478,6 +485,27 @@ ENDPOINTS: tuple[EndpointDefinition, ...] = (
     ),
     EndpointDefinition(
         "GET",
+        "/logs/history",
+        "log_history",
+        "Get cached global logs with optional short watch",
+        ("logs",),
+    ),
+    EndpointDefinition(
+        "GET",
+        "/logs/compact",
+        "log_compact",
+        "Get compact global logs for MCP or CLI usage",
+        ("logs",),
+    ),
+    EndpointDefinition(
+        "GET",
+        "/logs/stream",
+        "stream_logs",
+        "Stream global logs over SSE",
+        ("logs",),
+    ),
+    EndpointDefinition(
+        "GET",
         "/logs/events/{event_id}",
         "event_logs",
         "Get logs related to one event or message id",
@@ -857,4 +885,5 @@ def collect_models() -> list[type[BaseModel]]:
         if endpoint.request_model and endpoint.request_model not in models:
             models.append(endpoint.request_model)
     return models
+
 
