@@ -2,5 +2,5 @@ name: astrbot_plugin_mcp_tools
 desc: Expose AstrBot runtime managers, config, conversations, tools, and synthetic events through a FastAPI REST gateway.
 version: v0.2.0
 author: OpenCode
-repo: https://example.com/astrbot_plugin_mcp_tools
+repo: https://github.com/xunxiing/astrbot_plugin_mcp_tools
 
